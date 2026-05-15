@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 from datetime import datetime
 import os
 import random
+import shutil
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -21,8 +22,84 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 import time
+
+
+def build_http_headers(base_headers: dict[str, str]) -> dict[str, str]:
+    """Build headers suitable for httpx.
+
+    The headers in headers.json are browser-like. For httpx we must be careful
+    with compression: httpx can transparently decode gzip/deflate, but Brotli
+    (br) requires an extra dependency. If we advertise br without support,
+    the response body will look like "garbage".
+    """
+
+    # Remove hop-by-hop / request-specific headers that can cause issues.
+    drop = {
+        "host",
+        "content-length",
+        "connection",
+        "transfer-encoding",
+        "accept-encoding",
+    }
+    headers = {k: v for k, v in base_headers.items() if k.lower() not in drop}
+
+    # Default: only encodings we can decode without extra packages.
+    # Override with DBA_HTTP_ACCEPT_ENCODING if you know what you're doing.
+    accept_encoding = os.getenv("DBA_HTTP_ACCEPT_ENCODING", "gzip, deflate").strip()
+    if accept_encoding:
+        headers["Accept-Encoding"] = accept_encoding
+
+    return headers
+
+
+def decode_http_response_text(resp: httpx.Response, logger: logging.Logger) -> str:
+    """Return decoded text even when servers send compressed bodies."""
+
+    content_encoding = (resp.headers.get("Content-Encoding") or "").lower().strip()
+    if not content_encoding:
+        return resp.text
+
+    raw = resp.content
+    encoding = resp.encoding or "utf-8"
+
+    try:
+        if content_encoding == "br":
+            try:
+                import brotli  # type: ignore
+            except Exception as e:  # pragma: no cover
+                logger.warning(
+                    "Response is Brotli-compressed (Content-Encoding=br) but brotli is not installed (%s).",
+                    e,
+                )
+                return resp.text
+            return brotli.decompress(raw).decode(encoding, errors="replace")
+
+        if content_encoding == "gzip":
+            import gzip
+
+            return gzip.decompress(raw).decode(encoding, errors="replace")
+
+        if content_encoding == "deflate":
+            import zlib
+
+            # Some servers use raw deflate streams; try both.
+            try:
+                inflated = zlib.decompress(raw)
+            except zlib.error:
+                inflated = zlib.decompress(raw, -zlib.MAX_WBITS)
+            return inflated.decode(encoding, errors="replace")
+
+    except Exception as e:
+        logger.debug("Failed to manually decode response (%s); falling back to resp.text", e)
+        return resp.text
+
+    # Unknown encoding; fall back.
+    return resp.text
 
 
 @dataclass(frozen=True)
@@ -35,8 +112,8 @@ class DbaSearchParams:
 
     def to_query_params(self) -> dict[str, str]:
         params: dict[str, str] = {
-            "location": self.location,
             "q": self.q,
+            "location": self.location,
             "sort": self.sort,
         }
         if self.price_from is not None:
@@ -156,11 +233,13 @@ def search_dba_listings(search: DbaSearchParams, headers: dict[str, str], debug:
     url = f'https://www.dba.dk/recommerce/forsale/search?{urlencode(params)}'
     logger.debug(f"Request URL: {url}")
 
+    req_headers = build_http_headers(headers)
+
     try:
         logger.debug("Making HTTP/2 request...")
         # Use httpx with HTTP/2 support
         with httpx.Client(http2=True) as client:
-            response = client.get(url, headers=headers)
+            response = client.get(url, headers=req_headers)
             response.raise_for_status()
             logger.debug(f"Response status code: {response.status_code}")
             logger.debug(f"HTTP version: {response.http_version}")
@@ -169,14 +248,24 @@ def search_dba_listings(search: DbaSearchParams, headers: dict[str, str], debug:
             for key, value in response.headers.items():
                 logger.debug(f"{key}: {value}")
 
+            body_text = decode_http_response_text(response, logger)
             # Update the response body logging to show first 1000 characters
-            logger.debug(f"First 1000 chars of response: {response.text[:1000]}")
+            logger.debug(f"First 1000 chars of response: {body_text[:1000]}")
 
         # Parse HTML
         logger.debug("Parsing HTML response...")
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(body_text, 'html.parser')
         
-        all_listings = [a['href'] for a in soup.find_all('a', href=re.compile(r'https://www.dba.dk/recommerce/forsale/item/\d+'))]
+        logger.debug(f"\n\n{body_text}\n\n")
+
+        all_listings = [
+            str(a.get("href", "")).strip()
+            for a in soup.find_all(
+                "a",
+                href=re.compile(r"https://www\.dba\.dk/recommerce/forsale/item/\d+"),
+            )
+            if a.get("href")
+        ]
 
         logger.debug(f"Total urls found: {all_listings}")
 
@@ -218,28 +307,30 @@ def fetch_listing_info(url: str, headers: dict[str, str], debug: bool = False) -
     logger = logging.getLogger(__name__)
     listing_id = url.rstrip("/").split("/")[-1]
 
+    req_headers = build_http_headers(headers)
+
     with httpx.Client(http2=True, timeout=30.0) as client:
-        resp = client.get(url, headers=headers)
+        resp = client.get(url, headers=req_headers)
         resp.raise_for_status()
-        html = resp.text
+        html = decode_http_response_text(resp, logger)
 
     soup = BeautifulSoup(html, "html.parser")
 
     title = ""
     og_title = soup.find("meta", property="og:title")
     if og_title and og_title.get("content"):
-        title = og_title.get("content", "").strip()
+        title = str(og_title.get("content") or "").strip()
     if not title and soup.title and soup.title.string:
         title = soup.title.string.strip()
 
     description = ""
     og_desc = soup.find("meta", property="og:description")
     if og_desc and og_desc.get("content"):
-        description = og_desc.get("content", "").strip()
+        description = str(og_desc.get("content") or "").strip()
     if not description:
         meta_desc = soup.find("meta", attrs={"name": "description"})
         if meta_desc and meta_desc.get("content"):
-            description = meta_desc.get("content", "").strip()
+            description = str(meta_desc.get("content") or "").strip()
 
     # Fallback: take a bounded chunk of visible text.
     if not description:
@@ -433,33 +524,68 @@ def process_listings(
 
         listing_id = listing.split('/')[-1]
         driver.get(f"https://www.dba.dk/messages/new/{listing_id}")
-        time.sleep(5)
+        wait = WebDriverWait(driver, 20)
+
+        # Wait for the message composer to appear.
+        # Prefer stable attributes over absolute XPaths.
+        text_area = None
+        selectors = [
+            (By.CSS_SELECTOR, 'textarea[data-testid="TextArea"]'),
+            (By.CSS_SELECTOR, 'textarea[data-cy="TextArea"]'),
+            (By.CSS_SELECTOR, 'textarea[placeholder="Skriv en besked..."]'),
+            (By.CSS_SELECTOR, 'textarea[aria-label^="Type your message"]'),
+        ]
+        try:
+            for by, sel in selectors:
+                try:
+                    text_area = wait.until(EC.presence_of_element_located((by, sel)))
+                    # Ensure it's interactable
+                    wait.until(EC.element_to_be_clickable((by, sel)))
+                    break
+                except TimeoutException:
+                    continue
+
+            if text_area is None:
+                raise TimeoutException("Could not locate message textarea with known selectors")
+
+        except TimeoutException as e:
+            logging.error("Timed out waiting for message textarea: %s", e)
+            # If this happens, the page may show a login/CAPTCHA popup, an iframe, or a blocking modal.
+            # Leave early so we still record the listing in finally.
+            raise
 
         # click message seller button
         try:
-            text_area = driver.find_element(By.XPATH, '/html/body/div[1]/main/div/div[2]/section[2]/div[3]/div/textarea')
-            
-            if text_area:
-                logging.debug("Found text area")
-            else:
-                logging.error("Text area not found")
-
             message_file = os.getenv("MESSAGE_FILE", "message.txt")
             with open(message_file, 'r', encoding='utf-8') as file:
                 message = file.read().strip()
                 logging.debug(f"Read message from file: {message}")
-                
-            text_area.send_keys(message)
-            logging.debug(f"Entered message: {message}")
-            time.sleep(5)
 
-            send_button = driver.find_element(By.XPATH, '/html/body/div[1]/main/div/div[2]/section[2]/div[3]/div/button')
-            if send_button:
-                send_button.click()
-                logging.debug("Clicked 'Send' button")
-                time.sleep(10)
-            else:
-                logging.error("'Send' button not found")
+            # Focus and replace any prefilled text.
+            text_area.click()
+            text_area.send_keys(Keys.CONTROL, "a")
+            text_area.send_keys(Keys.BACKSPACE)
+
+            # The textarea aria-label indicates Enter sends.
+            text_area.send_keys(message)
+            text_area.send_keys(Keys.ENTER)
+            logging.debug("Entered message and pressed Enter")
+            time.sleep(2)
+
+            # Optional fallback: click a send button if Enter doesn't send.
+            for by, sel in [
+                (By.CSS_SELECTOR, 'button[type="submit"]'),
+                (By.CSS_SELECTOR, 'button[data-testid*="Send" i]'),
+                (By.CSS_SELECTOR, 'button[data-cy*="Send" i]'),
+            ]:
+                try:
+                    send_button = driver.find_element(by, sel)
+                except Exception:
+                    send_button = None
+                if send_button and send_button.is_displayed() and send_button.is_enabled():
+                    send_button.click()
+                    logging.debug("Clicked send button fallback: %s", sel)
+                    break
 
         except Exception as e:
             logging.error(f"Error sending message to seller: {e}")
@@ -472,10 +598,94 @@ def process_listings(
         
 
 def driver_setup():
+    logger = logging.getLogger(__name__)
+
     options = Options()
-    options.add_argument('--disable-dev-shm-usage')
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    return driver
+
+    # Common Linux stability flags (especially needed for snap Chromium and/or restricted environments).
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--remote-debugging-port=0")
+    options.add_argument("--window-size=1280,900")
+
+    if os.getenv("CHROME_HEADLESS") in {"1", "true", "yes", "on"}:
+        # NOTE: Headless is incompatible with the manual CAPTCHA/login step.
+        options.add_argument("--headless=new")
+
+    # Snap Chromium under Wayland can be flaky with ChromeDriver; force X11 when on Wayland.
+    if os.getenv("WAYLAND_DISPLAY"):
+        options.add_argument("--ozone-platform=x11")
+
+    # Ensure Chromium can write its profile + DevTools port file.
+    profile_dir = os.getenv("CHROME_PROFILE_DIR")
+    if not profile_dir:
+        profile_dir = os.path.join(get_data_dir(), "chrome-profile")
+    os.makedirs(profile_dir, exist_ok=True)
+    options.add_argument(f"--user-data-dir={profile_dir}")
+
+    # Prefer explicit browser binary when available.
+    chrome_binary = os.getenv("CHROME_BINARY")
+    if chrome_binary:
+        options.binary_location = chrome_binary
+    else:
+        snap_real_binary = "/snap/chromium/current/usr/lib/chromium-browser/chrome"
+        for candidate in ("google-chrome", "chromium", "chromium-browser"):
+            found = shutil.which(candidate)
+            if found:
+                # If Chromium is the snap, launch the real binary inside the snap.
+                # This avoids cases where snap-confined chromedriver fails to execvp the snap launcher.
+                if found == "/snap/bin/chromium" and os.path.exists(snap_real_binary):
+                    options.binary_location = snap_real_binary
+                else:
+                    options.binary_location = found
+                break
+
+    # Prefer system chromedriver (often installed alongside chromium) to avoid webdriver_manager mismatches.
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
+    chromedriver_log = os.path.join(get_data_dir(), "chromedriver.log")
+    service_args = ["--verbose"]
+    if chromedriver_path:
+        service = Service(
+            executable_path=chromedriver_path,
+            service_args=service_args,
+            log_output=chromedriver_log,
+        )
+    else:
+        service = Service(
+            ChromeDriverManager().install(),
+            service_args=service_args,
+            log_output=chromedriver_log,
+        )
+
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver
+    except Exception as e:
+        msg = str(e)
+        if "DevToolsActivePort file doesn't exist" in msg:
+            logger.error(
+                "Chrome failed to start (DevToolsActivePort). binary=%r chromedriver=%r profile_dir=%r DISPLAY=%r",
+                getattr(options, "binary_location", None),
+                chromedriver_path,
+                profile_dir,
+                os.getenv("DISPLAY"),
+            )
+            logger.error(
+                "If you're using snap Chromium, ensure /usr/bin/chromedriver matches Chromium and try CHROME_BINARY=/snap/bin/chromium. "
+                "If running without a GUI, you may need to add headless mode (e.g. set CHROME_HEADLESS=1 and add --headless=new)."
+            )
+
+        try:
+            if os.path.exists(chromedriver_log):
+                with open(chromedriver_log, "r", encoding="utf-8", errors="replace") as f:
+                    tail = f.readlines()[-60:]
+                if tail:
+                    logger.error("Last chromedriver log lines (%s):\n%s", chromedriver_log, "".join(tail))
+        except Exception:
+            pass
+        raise
 
 def login_to_dba(driver):
     # Add your Facebook login credentials here

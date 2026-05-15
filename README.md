@@ -75,6 +75,15 @@ python bot.py --product-file product_description.md --debug
 - `HEADERS_FILE` (default: `headers.json`)
 - `MESSAGE_FILE` (default: `message.txt`)
 
+### HTTP compression (garbled response fix)
+
+If you copied browser headers into `headers.json`, you may have `Accept-Encoding: ... br` enabled.
+Python `httpx` can decode `gzip`/`deflate` out of the box, but Brotli (`br`) requires an extra package.
+
+- Default behavior: the bot forces `Accept-Encoding` to `gzip, deflate` for its `httpx` requests.
+- Override (optional): set `DBA_HTTP_ACCEPT_ENCODING` (e.g. `identity` to disable compression).
+- If you really want `br`, install Brotli support (e.g. `pip install brotli`) and set `DBA_HTTP_ACCEPT_ENCODING="br, gzip, deflate"`.
+
 ## Important Notes
 
 - When first running the bot, ensure you:
